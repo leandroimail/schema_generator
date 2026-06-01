@@ -3,12 +3,13 @@ import yaml
 import json
 import pandas as pd
 import asyncio
+import argparse
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Union
 import io
 
 # Import our LLM client function
-from llm import run_llm_clients
+from llm import load_llm_client_configs, run_llm_clients, run_llm_clients_one
 from pydantic import BaseModel, ConfigDict, Field
 from py_markdown_table.markdown_table import markdown_table
 
@@ -36,6 +37,56 @@ class DataDictionary(BaseModel):
     table_name: str = Field(description="Table name inferred from the profile/sample metadata.")
     table_description: str = Field(description="General semantic description and use of the table.")
     fields: List[DictionaryField] = Field(description="One entry for every column in the table.")
+
+
+def output_file_stem(client_name: str, model_name: str) -> str:
+    safe = "".join(char if char.isalnum() or char in "_.-" else "_" for char in f"{client_name}_{model_name}")
+    return safe.strip("._") or "llm"
+
+
+def parsed_result_path(profile_output_dir: str, client_name: str, model_name: str) -> Path:
+    return Path(profile_output_dir) / "json" / f"{output_file_stem(client_name, model_name)}_parsed.json"
+
+
+def validate_dictionary_result(path: Path) -> Optional[str]:
+    if not path.exists():
+        return "missing result file"
+
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            data = json.load(file)
+    except json.JSONDecodeError as exc:
+        return f"invalid JSON: {exc}"
+    except OSError as exc:
+        return f"cannot read file: {exc}"
+
+    if isinstance(data, dict) and data.get("error"):
+        return f"LLM error: {data['error']}"
+    if isinstance(data, dict) and data.get("raw_content"):
+        return "raw_content fallback instead of parsed dictionary"
+
+    try:
+        DataDictionary.model_validate(data)
+    except Exception as exc:
+        return f"schema validation error: {exc}"
+
+    return None
+
+
+def find_dictionary_retry_targets(output_dir: str, profile_names: List[str]) -> Dict[str, List[str]]:
+    retry_targets: Dict[str, List[str]] = {}
+    configs = load_llm_client_configs()
+
+    for profile_name in profile_names:
+        profile_output_dir = os.path.join(output_dir, profile_name)
+        for config in configs:
+            result_path = parsed_result_path(profile_output_dir, config.name, config.model_name)
+            error = validate_dictionary_result(result_path)
+            if error:
+                retry_targets.setdefault(profile_name, []).append(config.id)
+                print(f"[retry] {profile_name} / {config.name} ({config.model_name}): {error}")
+
+    return retry_targets
 
 
 def load_config(config_path: str = "config.yaml") -> Dict[str, Any]:
@@ -123,7 +174,7 @@ def read_prompt_template(prompt_path: str) -> str:
         return ""
 
 
-async def generate_dictionaries() -> None:
+async def generate_dictionaries(retry_errors_only: bool = False, list_errors_only: bool = False) -> None:
     """
     Main function to generate data dictionaries using LLMs.
     """
@@ -175,8 +226,22 @@ async def generate_dictionaries() -> None:
         print("Failed to read prompt template. Exiting.")
         return
     
+    retry_targets: Dict[str, List[str]] = {}
+    if retry_errors_only or list_errors_only:
+        retry_targets = find_dictionary_retry_targets(output_dir, list(profiles.keys()))
+        total_targets = sum(len(targets) for targets in retry_targets.values())
+        print(f"Found {total_targets} result(s) to rerun.")
+        if list_errors_only:
+            return
+        if not retry_targets:
+            return
+
     # Process each profile and sample combination
     for profile_name, profile_data in profiles.items():
+        target_clients = retry_targets.get(profile_name)
+        if retry_errors_only and not target_clients:
+            continue
+
         # Find the sample with matching name if it exists
         sample_data = samples.get(profile_name, "")
         
@@ -197,9 +262,30 @@ async def generate_dictionaries() -> None:
         print(f"Processing dictionary generation for profile: {profile_name}")
         
         # Call the LLM clients to process the prompt
-        await run_llm_clients(prompt=prompt, base_output_dir=profile_output_dir, response_model=DataDictionary)
+        if target_clients:
+            for llm_name in target_clients:
+                await run_llm_clients_one(
+                    prompt=prompt,
+                    base_output_dir=profile_output_dir,
+                    llm_name=llm_name,
+                    response_model=DataDictionary,
+                )
+        else:
+            await run_llm_clients(prompt=prompt, base_output_dir=profile_output_dir, response_model=DataDictionary)
 
 
 if __name__ == "__main__":
-    # Run the async function
-    asyncio.run(generate_dictionaries())
+    parser = argparse.ArgumentParser(description="Generate data dictionaries using configured LLM clients.")
+    parser.add_argument(
+        "--retry-errors",
+        action="store_true",
+        help="Only rerun provider/profile combinations whose parsed JSON is missing, has error, or fails schema validation.",
+    )
+    parser.add_argument(
+        "--list-errors",
+        action="store_true",
+        help="List provider/profile combinations that would be rerun, without calling LLM APIs.",
+    )
+    args = parser.parse_args()
+
+    asyncio.run(generate_dictionaries(retry_errors_only=args.retry_errors, list_errors_only=args.list_errors))

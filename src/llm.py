@@ -41,6 +41,7 @@ class LLMClientConfig:
     Runtime configuration for one LLM execution target.
     """
 
+    id: str
     name: str
     provider: str
     model_name: str
@@ -117,6 +118,7 @@ def _load_client_config_from_env(client_id: str) -> Optional[LLMClientConfig]:
     }
 
     return LLMClientConfig(
+        id=client_id,
         name=os.getenv(f"{env_prefix}_NAME", client_id),
         provider=provider,
         model_name=model_name,
@@ -172,6 +174,7 @@ def load_llm_client_configs(selected: Optional[Union[str, List[str]]] = None) ->
             legacy_model_name = legacy_model_names.get(client_id)
             if legacy_model_name:
                 config = LLMClientConfig(
+                    id=config.id,
                     name=config.name,
                     provider=config.provider,
                     model_name=legacy_model_name,
