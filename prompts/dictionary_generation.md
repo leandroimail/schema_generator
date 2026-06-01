@@ -9,24 +9,25 @@ Act as a documentation and data modeling expert. Generate a complete data dictio
 
 1. **Context**  
    - Receive as input two blocks:  
-     - `## PROFILE` – profiling statistics (types, counts, nulls, distribution, etc.).  
-     - `## SAMPLE` – a sample of real records.
+     - `## Data Profile` – profiling statistics (types, counts, nulls, distribution, etc.).  
+     - `## Data Sample` – a sample of real records.
 
 2. **Table Description**  
-   - Table name (`table_name`) and a general description of its application / utility (`table_description`).
+   - Infer the table name (`table_name`) from the profile metadata when available.
+   - Generate a general description of the table's application / utility (`table_description`).
 
 3. **Field Description**  
-   For each column, generate an object with:  
+   Generate exactly one object for every column present in the profile/sample, using these fields:
    - `field_name` (string)  
    - `data_type` (string) – inferred data type  
    - `field_description` (string) – purpose and relation to the rest of the model  
-   - `example_value` (string or number) – representative value extracted from the sample  
-   - **Optional**: `domain_values` (array) – if it is an enum or restricted domain, list all possible values.  
-   - `full_description` (string) – concatenation of the fields field_description + example_value or domain_values
+   - `example_value` (string, number, boolean, or null) – representative scalar value extracted from the sample  
+   - `domain_values` (array, optional) – if it is an enum or restricted domain, list all known values. Omit this field when it is not applicable.  
+   - `full_description` (string) – concatenate `field_description` with either `Domain: <domain_values>` when `domain_values` exists, or `Example: <example_value>` otherwise.
 
 4. **Output Format**  
-   - Return **only** a valid JSON, without additional text.  
-   - Minimum structure:
+   - Return **only** one valid JSON object, without Markdown, comments, explanations, or surrounding text.  
+   - The JSON object must follow this structure:
 
      ```json
      {
@@ -48,7 +49,6 @@ Act as a documentation and data modeling expert. Generate a complete data dictio
            "example_value": 123,
            "full_description": "Detailed description - Example: 123"
          }
-         // ... other fields
        ]
      }
      ```
@@ -58,7 +58,7 @@ Act as a documentation and data modeling expert. Generate a complete data dictio
 
 ```json
 <profile>
-````
+```
 
 ---
 ## Data Sample

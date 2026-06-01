@@ -4,12 +4,38 @@ import json
 import pandas as pd
 import asyncio
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Union
 import io
 
 # Import our LLM client function
 from llm import run_llm_clients
+from pydantic import BaseModel, ConfigDict, Field
 from py_markdown_table.markdown_table import markdown_table
+
+
+JSONPrimitive = Union[str, int, float, bool, None]
+
+
+class DictionaryField(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    field_name: str = Field(description="Column name exactly as it appears in the input data.")
+    data_type: str = Field(description="Inferred data type for the column.")
+    field_description: str = Field(description="Semantic description of the column.")
+    example_value: JSONPrimitive = Field(description="Representative scalar value from the sample, or null when unavailable.")
+    full_description: str = Field(description="field_description plus Domain or Example detail.")
+    domain_values: Optional[List[JSONPrimitive]] = Field(
+        default=None,
+        description="Known enum/restricted values. Null or omitted when the field has no restricted domain.",
+    )
+
+
+class DataDictionary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    table_name: str = Field(description="Table name inferred from the profile/sample metadata.")
+    table_description: str = Field(description="General semantic description and use of the table.")
+    fields: List[DictionaryField] = Field(description="One entry for every column in the table.")
 
 
 def load_config(config_path: str = "config.yaml") -> Dict[str, Any]:
@@ -171,7 +197,7 @@ async def generate_dictionaries() -> None:
         print(f"Processing dictionary generation for profile: {profile_name}")
         
         # Call the LLM clients to process the prompt
-        await run_llm_clients(prompt=prompt, base_output_dir=profile_output_dir)
+        await run_llm_clients(prompt=prompt, base_output_dir=profile_output_dir, response_model=DataDictionary)
 
 
 if __name__ == "__main__":
