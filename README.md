@@ -121,10 +121,37 @@ Contains sensitive information and LLM configuration, such as API keys and model
 
 **Example excerpt:**
 ```env
-GEMINI_API_KEY=AIzaSyCw-...
-GEMINI_MODEL_NAME=gemini-2.5-pro-preview-05-06
-LLM_GEMINI_IS_REASONER=true
+LLM_CLIENTS=openai_small,google_small,deepseek_small
+LLM_STRUCTURED_OUTPUT=true
+
+LLM_OPENAI_SMALL_PROVIDER=openai
+LLM_OPENAI_SMALL_MODEL=gpt-5.4-nano
+LLM_OPENAI_SMALL_API_KEY_ENV=OPENAI_API_KEY
+
+LLM_GOOGLE_SMALL_PROVIDER=google
+LLM_GOOGLE_SMALL_MODEL=gemini-3.5-flash
+LLM_GOOGLE_SMALL_API_KEY_ENV=GEMINI_API_KEY
+LLM_GOOGLE_SMALL_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
+
+LLM_DEEPSEEK_SMALL_PROVIDER=deepseek
+LLM_DEEPSEEK_SMALL_MODEL=deepseek-v4-flash
+LLM_DEEPSEEK_SMALL_API_KEY_ENV=DEEPSEEK_API_KEY
+LLM_DEEPSEEK_SMALL_BASE_URL=https://api.deepseek.com
+
+OPENAI_API_KEY=sk-...
+GEMINI_API_KEY=AIza...
+DEEPSEEK_API_KEY=sk-...
 ```
+
+`LLM_CLIENTS` can contain any number of named targets. Each target uses the
+`LLM_<TARGET>_*` variables, so you can run several keys, providers, or models in
+one execution. The legacy variables (`OPENAI_MODEL_NAME`, `GEMINI_MODEL_NAME`,
+`DEEPSEEK_MODEL_NAME`) still work when `LLM_CLIENTS` is not set.
+
+The Google target uses Gemini's OpenAI-compatible endpoint by default. OpenAI
+and Gemini targets can request strict JSON Schema outputs; DeepSeek is kept in
+JSON object mode because its OpenAI-compatible API supports JSON output but does
+not provide the same strict schema guarantee.
 
 ---
 

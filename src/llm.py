@@ -4,6 +4,7 @@ import json
 import re
 import time
 import logging
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Any, Union, Literal, TypeVar, Generic, Type, Tuple
 from dotenv import load_dotenv
 from pathlib import Path
@@ -32,6 +33,158 @@ logger = logging.getLogger("llm_processing")
 
 # Define type variable for generic pydantic models
 T_PydanticModel = TypeVar('T_PydanticModel', bound=BaseModel)
+
+
+@dataclass(frozen=True)
+class LLMClientConfig:
+    """
+    Runtime configuration for one LLM execution target.
+    """
+
+    name: str
+    provider: str
+    model_name: str
+    api_key: str
+    base_url: Optional[str] = None
+    enabled: bool = True
+    structured_output: bool = True
+    use_json_schema: bool = False
+    is_reasoner: bool = False
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _normalize_client_id(value: str) -> str:
+    return re.sub(r"[^A-Z0-9]+", "_", value.upper()).strip("_")
+
+
+def _safe_filename(value: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")
+    return safe or "llm"
+
+
+def _load_client_config_from_env(client_id: str) -> Optional[LLMClientConfig]:
+    env_prefix = f"LLM_{_normalize_client_id(client_id)}"
+    provider = os.getenv(f"{env_prefix}_PROVIDER", client_id).strip().lower()
+    enabled = _env_bool(f"{env_prefix}_ENABLED", True)
+
+    model_name = os.getenv(f"{env_prefix}_MODEL") or os.getenv(f"{env_prefix}_MODEL_NAME")
+    api_key_env = os.getenv(f"{env_prefix}_API_KEY_ENV")
+    api_key = os.getenv(f"{env_prefix}_API_KEY")
+
+    if not api_key_env:
+        default_key_envs = {
+            "openai": "OPENAI_API_KEY",
+            "google": "GEMINI_API_KEY",
+            "gemini": "GEMINI_API_KEY",
+            "gemini_native": "GEMINI_API_KEY",
+            "deepseek": "DEEPSEEK_API_KEY",
+        }
+        api_key_env = default_key_envs.get(provider)
+
+    if not api_key and api_key_env:
+        api_key = os.getenv(api_key_env)
+    if not api_key and provider in {"google", "gemini", "gemini_native"}:
+        api_key = os.getenv("GOOGLE_API_KEY")
+
+    default_models = {
+        "openai": "gpt-5.4-nano",
+        "google": "gemini-3.5-flash",
+        "gemini": "gemini-3.5-flash",
+        "gemini_native": "gemini-3.5-flash",
+        "deepseek": "deepseek-v4-flash",
+    }
+    model_name = model_name or default_models.get(provider)
+
+    if not enabled:
+        return None
+    if not api_key:
+        logger.warning("Skipping LLM client %s: API key not found", client_id)
+        return None
+    if not model_name:
+        logger.warning("Skipping LLM client %s: model not configured", client_id)
+        return None
+
+    default_base_urls = {
+        "google": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "deepseek": os.getenv("DEEPSEEK_API_BASE_URL", "https://api.deepseek.com"),
+    }
+
+    return LLMClientConfig(
+        name=os.getenv(f"{env_prefix}_NAME", client_id),
+        provider=provider,
+        model_name=model_name,
+        api_key=api_key,
+        base_url=os.getenv(f"{env_prefix}_BASE_URL") or default_base_urls.get(provider),
+        structured_output=_env_bool(f"{env_prefix}_STRUCTURED_OUTPUT", _env_bool("LLM_STRUCTURED_OUTPUT", True)),
+        use_json_schema=_env_bool(f"{env_prefix}_USE_JSON_SCHEMA", provider in {"openai", "google", "gemini"}),
+        is_reasoner=_env_bool(f"{env_prefix}_IS_REASONER", _env_bool("LLM_IS_REASONER_ABSTRACT", False)),
+    )
+
+
+def load_llm_client_configs(selected: Optional[Union[str, List[str]]] = None) -> List[LLMClientConfig]:
+    """
+    Load any number of LLM client configs from .env.
+
+    Preferred .env format:
+        LLM_CLIENTS=openai_main,google_flash,deepseek_chat
+        LLM_OPENAI_MAIN_PROVIDER=openai
+        LLM_OPENAI_MAIN_MODEL=gpt-4.1-mini
+        LLM_OPENAI_MAIN_API_KEY_ENV=OPENAI_API_KEY
+
+    If LLM_CLIENTS is absent, this falls back to the previous OPENAI/GEMINI/DEEPSEEK
+    variables so existing setups keep working.
+    """
+    if isinstance(selected, str) and selected:
+        selected_ids = {item.strip().lower() for item in selected.split(",") if item.strip()}
+    elif isinstance(selected, list):
+        selected_ids = {item.strip().lower() for item in selected if item.strip()}
+    else:
+        selected_ids = set()
+
+    client_ids = [item.strip() for item in os.getenv("LLM_CLIENTS", "").split(",") if item.strip()]
+    if not client_ids:
+        client_ids = []
+        if os.getenv("OPENAI_API_KEY"):
+            client_ids.append("openai")
+        if os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"):
+            client_ids.append("gemini_native")
+        if os.getenv("DEEPSEEK_API_KEY"):
+            client_ids.append("deepseek")
+
+    configs = []
+    for client_id in client_ids:
+        if selected_ids and client_id.lower() not in selected_ids:
+            continue
+        config = _load_client_config_from_env(client_id)
+        if config and not os.getenv("LLM_CLIENTS"):
+            legacy_model_names = {
+                "openai": os.getenv("OPENAI_MODEL_NAME"),
+                "gemini_native": os.getenv("GEMINI_MODEL_NAME"),
+                "deepseek": os.getenv("DEEPSEEK_MODEL_NAME"),
+            }
+            legacy_model_name = legacy_model_names.get(client_id)
+            if legacy_model_name:
+                config = LLMClientConfig(
+                    name=config.name,
+                    provider=config.provider,
+                    model_name=legacy_model_name,
+                    api_key=config.api_key,
+                    base_url=config.base_url,
+                    enabled=config.enabled,
+                    structured_output=config.structured_output,
+                    use_json_schema=config.use_json_schema,
+                    is_reasoner=config.is_reasoner,
+                )
+        if config:
+            configs.append(config)
+    return configs
 
 
 class BaseLLMClient:
@@ -119,7 +272,16 @@ class BaseLLMClient:
 class OpenAIClient(BaseLLMClient, Generic[T_PydanticModel]):
     """Client for OpenAI API."""
 
-    def __init__(self, api_key: str, model_name: str):
+    def __init__(
+        self,
+        api_key: str,
+        model_name: str,
+        *,
+        base_url: Optional[str] = None,
+        client_name: str = "openai",
+        structured_output: bool = True,
+        use_json_schema: bool = True,
+    ):
         """
         Initialize the OpenAI client.
         
@@ -128,12 +290,74 @@ class OpenAIClient(BaseLLMClient, Generic[T_PydanticModel]):
             model_name (str): The name of the OpenAI model to use
         """
         super().__init__(api_key, model_name)
-        # We'll initialize the client in the initialize_client method
+        self.base_url = base_url
+        self.client_name = client_name
+        self.structured_output = structured_output
+        self.use_json_schema = use_json_schema
         
     async def initialize_client(self):
         """Initialize the async client session."""
         from openai import AsyncOpenAI
-        self.async_client = AsyncOpenAI(api_key=self.api_key)
+        client_kwargs = {"api_key": self.api_key}
+        if self.base_url:
+            client_kwargs["base_url"] = self.base_url
+        self.async_client = AsyncOpenAI(**client_kwargs)
+
+    def _json_object_response_format(self) -> Optional[Dict[str, str]]:
+        if not self.structured_output:
+            return None
+        return {"type": "json_object"}
+
+    def _strict_json_schema(self, schema: Dict[str, Any]) -> Dict[str, Any]:
+        if schema.get("type") == "object" and isinstance(schema.get("properties"), dict):
+            properties = schema["properties"]
+            schema["required"] = list(properties.keys())
+            schema["additionalProperties"] = False
+            for property_schema in properties.values():
+                if isinstance(property_schema, dict):
+                    self._strict_json_schema(property_schema)
+        if schema.get("type") == "array" and isinstance(schema.get("items"), dict):
+            self._strict_json_schema(schema["items"])
+        for keyword in ("anyOf", "oneOf", "allOf"):
+            if isinstance(schema.get(keyword), list):
+                for item in schema[keyword]:
+                    if isinstance(item, dict):
+                        self._strict_json_schema(item)
+        if isinstance(schema.get("$defs"), dict):
+            for definition in schema["$defs"].values():
+                if isinstance(definition, dict):
+                    self._strict_json_schema(definition)
+        return schema
+
+    def _json_schema_response_format(self, response_model: Type[T_PydanticModel]) -> Dict[str, Any]:
+        schema = self._strict_json_schema(response_model.model_json_schema())
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": response_model.__name__,
+                "schema": schema,
+                "strict": True,
+            },
+        }
+
+    def _messages_with_schema_hint(
+        self,
+        messages: List[Dict[str, str]],
+        response_model: Type[T_PydanticModel],
+    ) -> List[Dict[str, str]]:
+        schema = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
+        schema_hint = (
+            "\n\nReturn JSON that conforms exactly to this JSON Schema. "
+            "Use the top-level keys table_name, table_description, and fields. "
+            "Do not use alternative keys such as columns.\n"
+            f"{schema}"
+        )
+        hinted_messages = [message.copy() for message in messages]
+        if hinted_messages and hinted_messages[-1].get("role") == "user":
+            hinted_messages[-1]["content"] = hinted_messages[-1].get("content", "") + schema_hint
+        else:
+            hinted_messages.append({"role": "user", "content": schema_hint})
+        return hinted_messages
 
     async def generate_text(self, prompt: str) -> str:
         """
@@ -146,13 +370,17 @@ class OpenAIClient(BaseLLMClient, Generic[T_PydanticModel]):
             str: The generated text.
         """
         try:
-            response = await self.async_client.chat.completions.create(
-                model=self.model_name,
-                messages=[{"role": "user", "content": prompt}]
-            )
+            request_params = {
+                "model": self.model_name,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            response_format = self._json_object_response_format()
+            if response_format:
+                request_params["response_format"] = response_format
+            response = await self.async_client.chat.completions.create(**request_params)
             return response.choices[0].message.content
         except Exception as e:
-            print(f"Error generating text with OpenAI: {e}")
+            print(f"Error generating text with {self.client_name}: {e}")
             return ""
             
     def parse(self, messages: List[Dict[str, str]], response_model: Type[T_PydanticModel]) -> T_PydanticModel:
@@ -167,20 +395,29 @@ class OpenAIClient(BaseLLMClient, Generic[T_PydanticModel]):
             T_PydanticModel: Parsed response in the specified Pydantic model
         """
         from openai import OpenAI
-        client = OpenAI(api_key=self.api_key)
+        client_kwargs = {"api_key": self.api_key}
+        if self.base_url:
+            client_kwargs["base_url"] = self.base_url
+        client = OpenAI(**client_kwargs)
         
         try:
+            response_format = (
+                self._json_schema_response_format(response_model)
+                if self.use_json_schema
+                else self._json_object_response_format()
+            )
+            request_messages = messages if self.use_json_schema else self._messages_with_schema_hint(messages, response_model)
             response = client.chat.completions.create(
                 model=self.model_name,
-                messages=messages,
-                response_format={"type": "json_object"}
+                messages=request_messages,
+                response_format=response_format,
             )
             
             response_content = response.choices[0].message.content or "{}"
             parsed_response = json.loads(response_content)
             return response_model.model_validate(parsed_response)
         except Exception as e:
-            raise Exception(f"Error parsing OpenAI response: {e}")
+            raise Exception(f"Error parsing {self.client_name} response: {e}")
             
     async def async_parse(self, messages: List[Dict[str, str]], response_model: Type[T_PydanticModel]) -> T_PydanticModel:
         """
@@ -194,18 +431,23 @@ class OpenAIClient(BaseLLMClient, Generic[T_PydanticModel]):
             T_PydanticModel: Parsed response in the specified Pydantic model
         """
         try:
+            response_content = "{}"
             request_params = {
                 "model": self.model_name,
-                "messages": messages,
-                "response_format": {"type": "json_object"},
+                "messages": messages if self.use_json_schema else self._messages_with_schema_hint(messages, response_model),
             }
+            request_params["response_format"] = (
+                self._json_schema_response_format(response_model)
+                if self.use_json_schema
+                else self._json_object_response_format()
+            )
             completion = await self.async_client.chat.completions.create(**request_params)
             response_content = completion.choices[0].message.content or "{}"
 
             parsed_response = json.loads(response_content)
             return response_model.model_validate(parsed_response)
         except Exception as e:
-            raise Exception(f"Error asynchronously parsing OpenAI response: {e}. Response content: '{response_content[:200]}...'")
+            raise Exception(f"Error asynchronously parsing {self.client_name} response: {e}. Response content: '{response_content[:200]}...'")
 
     async def generate_embeddings(self, text: str) -> List[float]:
         """
@@ -403,12 +645,12 @@ class GeminiClient(BaseLLMClient):
         pass
 
 
-class DeepSeekClient(BaseLLMClient):
+class DeepSeekClient(OpenAIClient):
     """
     Client for interacting with the DeepSeek API.
     """
 
-    def __init__(self, api_key: str, model_name: str):
+    def __init__(self, api_key: str, model_name: str, *, base_url: Optional[str] = None, client_name: str = "deepseek"):
         """
         Initializes the DeepSeek client.
 
@@ -416,37 +658,14 @@ class DeepSeekClient(BaseLLMClient):
             api_key (str): The DeepSeek API key.
             model_name (str): The name of the DeepSeek model to use.
         """
-        super().__init__(api_key, model_name)
-        
-    async def initialize_client(self):
-        """
-        Initializes the client - for DeepSeek we use OpenAI's client.
-        """
-        from openai import AsyncOpenAI
-        self.async_client = AsyncOpenAI(
-            api_key=self.api_key,
-            base_url=os.getenv("DEEPSEEK_API_BASE_URL", "https://api.deepseek.com/v1")
+        super().__init__(
+            api_key=api_key,
+            model_name=model_name,
+            base_url=base_url or os.getenv("DEEPSEEK_API_BASE_URL", "https://api.deepseek.com"),
+            client_name=client_name,
+            structured_output=True,
+            use_json_schema=False,
         )
-
-    async def generate_text(self, prompt: str) -> str:
-        """
-        Generates text using the DeepSeek API.
-
-        Args:
-            prompt (str): The prompt to use for text generation.
-
-        Returns:
-            str: The generated text.
-        """
-        try:
-            response = await self.async_client.chat.completions.create(
-                model=self.model_name,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            print(f"Error generating text with DeepSeek: {e}")
-            return ""
 
     async def generate_embeddings(self, text: str) -> List[float]:
         """
@@ -575,8 +794,12 @@ string json to convert:
         client_initialized = False
         if llm_client is None:
             # Get environment variables for parsing video
-            model_name = os.getenv("OPENAI_PARSE_VIDEO_MODEL_NAME", "gpt-4.1-nano")
-            api_key = os.getenv("OPENAI_PARSE_VIDEO_API_KEY")
+            model_name = (
+                os.getenv("OPENAI_PARSE_JSON_MODEL_NAME")
+                or os.getenv("OPENAI_PARSE_VIDEO_MODEL_NAME")
+                or "gpt-5.4-nano"
+            )
+            api_key = os.getenv("OPENAI_PARSE_JSON_API_KEY") or os.getenv("OPENAI_PARSE_VIDEO_API_KEY")
             
             if not api_key:
                 error_msg = "Error: API key for LLM not found"
@@ -605,7 +828,11 @@ string json to convert:
         return {"error": str(e)}
 
 
-async def process_text_with_llm(llm_client: BaseLLMClient, text: str) -> Tuple[str, str, Dict[str, Any], str]:
+async def process_text_with_llm(
+    llm_client: BaseLLMClient,
+    text: str,
+    response_model: Optional[Type[T_PydanticModel]] = None,
+) -> Tuple[str, str, Dict[str, Any], str]:
     """
     Processes the given text using the specified LLM client and returns structured data.
 
@@ -619,29 +846,44 @@ async def process_text_with_llm(llm_client: BaseLLMClient, text: str) -> Tuple[s
     """
     try:
         start_time = time.time()
-        generated_text = await llm_client.generate_text(text)
+        if response_model:
+            messages = [
+                {
+                    "role": "system",
+                    "content": "Return only JSON that conforms to the requested schema.",
+                },
+                {"role": "user", "content": text},
+            ]
+            parsed_model = await llm_client.async_parse(messages, response_model)
+            parsed_data = parsed_model.model_dump(mode="json")
+            generated_text = json.dumps(parsed_data, ensure_ascii=False, indent=2)
+        else:
+            generated_text = await llm_client.generate_text(text)
         end_time = time.time()
         processing_time = end_time - start_time
 
         logger.info(f"LLM {llm_client.__class__.__name__} processed text in {processing_time:.2f} seconds.")
-        
-        # Parse the generated text as JSON
-        parsed_data = clean_and_parse_json(generated_text)
-        
-        # If parsing failed or returned minimal data, try using the LLM to convert to JSON
-        if "raw_content" in parsed_data:
-            logger.info(f"Initial JSON parsing failed, using LLM to convert to JSON")
-            parsed_data = await convert_to_json_llm(generated_text, llm_client)
+
+        if not response_model:
+            # Parse the generated text as JSON
+            parsed_data = clean_and_parse_json(generated_text)
+
+            # If parsing failed or returned minimal data, try using the LLM to convert to JSON
+            if "raw_content" in parsed_data:
+                logger.info(f"Initial JSON parsing failed, using LLM to convert to JSON")
+                parsed_data = await convert_to_json_llm(generated_text, llm_client)
 
         # Return the model name as well
         model_name = llm_client.model_name
-        return llm_client.__class__.__name__, generated_text, parsed_data, model_name
+        client_name = getattr(llm_client, "client_name", llm_client.__class__.__name__)
+        return client_name, generated_text, parsed_data, model_name
 
     except Exception as e:
-        error_msg = f"Error processing text with LLM {llm_client.__class__.__name__}: {e}"
+        client_name = getattr(llm_client, "client_name", llm_client.__class__.__name__)
+        error_msg = f"Error processing text with LLM {client_name}: {e}"
         print(error_msg)
         logger.error(error_msg)
-        return llm_client.__class__.__name__, "", {"error": str(e)}, llm_client.model_name
+        return client_name, "", {"error": str(e)}, llm_client.model_name
 
 
 def save_response_data(llm_name: str, model_name: str, text_id: str, generated_text: str, parsed_data: Dict[str, Any], prompt: str, base_output_dir: str = "data/llm_results") -> Tuple[str, str, str]:
@@ -651,7 +893,7 @@ def save_response_data(llm_name: str, model_name: str, text_id: str, generated_t
     
     Args:
         llm_name (str): Name of the LLM client class
-        model_name (str): Actual model name (e.g., gpt-4.1-nano, gemini-pro)
+        model_name (str): Actual model name (e.g., gpt-5.4-nano, gemini-3.5-flash)
         text_id (str): Identifier for the processed text
         generated_text (str): Raw text generated by the LLM
         parsed_data (Dict[str, Any]): Parsed JSON data from the response
@@ -672,9 +914,10 @@ def save_response_data(llm_name: str, model_name: str, text_id: str, generated_t
         prompts_output_dir.mkdir(parents=True, exist_ok=True)
         
         # Use model name for filenames
-        raw_file_path = raw_output_dir / f"{model_name}_raw.txt"
-        json_file_path = json_output_dir / f"{model_name}_parsed.json"
-        prompt_file_path = prompts_output_dir / f"{model_name}_prompt.txt"
+        file_stem = _safe_filename(f"{llm_name}_{model_name}")
+        raw_file_path = raw_output_dir / f"{file_stem}_raw.txt"
+        json_file_path = json_output_dir / f"{file_stem}_parsed.json"
+        prompt_file_path = prompts_output_dir / f"{file_stem}_prompt.txt"
         
         # Save raw text response
         with open(raw_file_path, "w", encoding="utf-8") as f:
@@ -763,7 +1006,79 @@ def save_structured_data(
         except Exception as fallback_error:
             logger.error(f"Failed to save fallback text representation: {fallback_error}")
 
-async def run_llm_clients(prompt: str, base_output_dir: str = "") -> None:
+
+def create_llm_client(config: LLMClientConfig) -> BaseLLMClient:
+    provider = config.provider.lower()
+    if provider == "openai":
+        return OpenAIClient(
+            api_key=config.api_key,
+            model_name=config.model_name,
+            base_url=config.base_url,
+            client_name=config.name,
+            structured_output=config.structured_output,
+            use_json_schema=config.use_json_schema,
+        )
+    if provider in {"google", "gemini"}:
+        return OpenAIClient(
+            api_key=config.api_key,
+            model_name=config.model_name,
+            base_url=config.base_url or "https://generativelanguage.googleapis.com/v1beta/openai/",
+            client_name=config.name,
+            structured_output=config.structured_output,
+            use_json_schema=config.use_json_schema,
+        )
+    if provider == "gemini_native":
+        client = GeminiClient(api_key=config.api_key, model_name=config.model_name)
+        client.client_name = config.name
+        return client
+    if provider == "deepseek":
+        return DeepSeekClient(
+            api_key=config.api_key,
+            model_name=config.model_name,
+            base_url=config.base_url,
+            client_name=config.name,
+        )
+    raise ValueError(f"Unsupported LLM provider: {config.provider}")
+
+
+async def _run_configs(
+    prompt: str,
+    configs: List[LLMClientConfig],
+    base_output_dir: str,
+    response_model: Optional[Type[T_PydanticModel]] = None,
+) -> None:
+    if not configs:
+        raise ValueError("No enabled LLM clients found. Configure LLM_CLIENTS or legacy provider API keys in .env.")
+
+    clients = [create_llm_client(config) for config in configs]
+    try:
+        await asyncio.gather(*[client.initialize_client() for client in clients])
+
+        async def process_with_client(client: BaseLLMClient):
+            llm_name, generated_text, parsed_data, model_name = await process_text_with_llm(client, prompt, response_model)
+            print(f"LLM: {llm_name} (Model: {model_name}), Generated Text: {generated_text[:50]}...")
+
+            raw_path, json_path, prompt_path = save_response_data(
+                llm_name=llm_name,
+                model_name=model_name,
+                text_id=prompt,
+                generated_text=generated_text,
+                parsed_data=parsed_data,
+                prompt=prompt,
+                base_output_dir=base_output_dir,
+            )
+
+            print(f"Results saved to {raw_path}, {json_path}, and {prompt_path}")
+
+        await asyncio.gather(*[process_with_client(client) for client in clients])
+    finally:
+        await asyncio.gather(*[client.close_client() for client in clients], return_exceptions=True)
+
+async def run_llm_clients(
+    prompt: str,
+    base_output_dir: str = "",
+    response_model: Optional[Type[T_PydanticModel]] = None,
+) -> None:
     """
     Process a prompt with multiple LLM clients and save the results.
     
@@ -771,59 +1086,17 @@ async def run_llm_clients(prompt: str, base_output_dir: str = "") -> None:
         prompt (str): The prompt to process
         base_output_dir (str): Base directory to save results
     """
-    # Load API keys and model names from environment variables
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    openai_model_name = os.getenv("OPENAI_MODEL_NAME", "gpt-4.1-nano")
-    gemini_api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    gemini_model_name = os.getenv("GEMINI_MODEL_NAME", "gemini-pro")
-    deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
-    deepseek_model_name = os.getenv("DEEPSEEK_MODEL_NAME", "deepseek-chat")
-
-    # Create output directory
     if not base_output_dir:
         base_output_dir = os.getenv("LLM_OUTPUT_DIR", "data/llm_results")
-    
-    # Initialize LLM clients
-    openai_client = OpenAIClient(api_key=openai_api_key, model_name=openai_model_name)
-    gemini_client = GeminiClient(api_key=gemini_api_key, model_name=gemini_model_name)
-    deepseek_client = DeepSeekClient(api_key=deepseek_api_key, model_name=deepseek_model_name)
-
-    await openai_client.initialize_client()
-    await gemini_client.initialize_client()
-    await deepseek_client.initialize_client()
-    texts = [prompt]
-
-    # Process texts with each LLM
-    async def process_with_client(client, text):
-        llm_name, generated_text, parsed_data, model_name = await process_text_with_llm(client, text)
-        print(f"LLM: {llm_name} (Model: {model_name}), Generated Text: {generated_text[:50]}...")
-        
-        # Save both raw response, parsed data, and prompt
-        raw_path, json_path, prompt_path = save_response_data(
-            llm_name=llm_name,
-            model_name=model_name,
-            text_id=text,
-            generated_text=generated_text,
-            parsed_data=parsed_data,
-            prompt=text,  # Save the original prompt
-            base_output_dir=base_output_dir
-        )
-        
-        print(f"Results saved to {raw_path}, {json_path}, and {prompt_path}")
-
-    # Use asyncio.gather to run the processing concurrently
-    await asyncio.gather(
-        *[process_with_client(openai_client, text) for text in texts],
-        *[process_with_client(gemini_client, text) for text in texts],
-        *[process_with_client(deepseek_client, text) for text in texts],
-    )
-
-    await openai_client.close_client()
-    await gemini_client.close_client()
-    await deepseek_client.close_client()
+    await _run_configs(prompt, load_llm_client_configs(), base_output_dir, response_model)
 
 
-async def run_llm_clients_one(prompt: str, base_output_dir: str = "", llm_name: str = "") -> None:
+async def run_llm_clients_one(
+    prompt: str,
+    base_output_dir: str = "",
+    llm_name: str = "",
+    response_model: Optional[Type[T_PydanticModel]] = None,
+) -> None:
     """
     Process a prompt with a single LLM client specified by name and save the results.
     
@@ -832,53 +1105,9 @@ async def run_llm_clients_one(prompt: str, base_output_dir: str = "", llm_name: 
         base_output_dir (str): Base directory to save results
         llm_name (str): Name of the LLM to use ("openai", "gemini", or "deepseek")
     """
-    # Normalize the llm_name to lowercase for case-insensitive comparison
-    llm_name = llm_name.lower() if llm_name else "openai"  # Default to OpenAI if not specified
-    
-    # Load API keys and model names from environment variables based on the selected LLM
-    client = None
-    
-    if llm_name == "openai":
-        openai_api_key = os.getenv("OPENAI_API_KEY")
-        openai_model_name = os.getenv("OPENAI_MODEL_NAME", "gpt-4.1-nano")
-        client = OpenAIClient(api_key=openai_api_key, model_name=openai_model_name)
-    elif llm_name == "gemini":
-        gemini_api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-        gemini_model_name = os.getenv("GEMINI_MODEL_NAME", "gemini-pro")
-        client = GeminiClient(api_key=gemini_api_key, model_name=gemini_model_name)
-    elif llm_name == "deepseek":
-        deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
-        deepseek_model_name = os.getenv("DEEPSEEK_MODEL_NAME", "deepseek-chat")
-        client = DeepSeekClient(api_key=deepseek_api_key, model_name=deepseek_model_name)
-    else:
-        raise ValueError(f"Unsupported LLM: {llm_name}. Choose from: openai, gemini, deepseek")
-
-    # Create output directory
     if not base_output_dir:
         base_output_dir = os.getenv("LLM_OUTPUT_DIR", "data/llm_results")
-    
-    # Initialize LLM client
-    await client.initialize_client()
-    
-    # Process text with the selected LLM
-    llm_name_result, generated_text, parsed_data, model_name = await process_text_with_llm(client, prompt)
-    print(f"LLM: {llm_name_result} (Model: {model_name}), Generated Text: {generated_text[:50]}...")
-    
-    # Save both raw response, parsed data, and prompt
-    raw_path, json_path, prompt_path = save_response_data(
-        llm_name=llm_name_result,
-        model_name=model_name,
-        text_id=prompt,
-        generated_text=generated_text,
-        parsed_data=parsed_data,
-        prompt=prompt,  # Save the original prompt
-        base_output_dir=base_output_dir
-    )
-    
-    print(f"Results saved to {raw_path}, {json_path}, and {prompt_path}")
-    
-    # Close the client
-    await client.close_client()
+    await _run_configs(prompt, load_llm_client_configs(llm_name), base_output_dir, response_model)
 
 
 if __name__ == "__main__":
