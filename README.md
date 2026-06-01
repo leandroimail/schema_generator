@@ -238,6 +238,22 @@ python src/compare_results_dictionary.py
 ```
 Esse script compara apenas as distâncias entre os dicionários gerados, útil para avaliação quantitativa dos resultados de matching.
 
+### 8. Bootstrap do BIRD Mini-Dev
+Para baixar/processar o benchmark BIRD Mini-Dev e gerar dicionários-base, amostras e perfis compatíveis com o pipeline existente:
+```bash
+uv run python src/bootstrap_bird_mini_dev.py --update-config
+```
+
+O script consome o ZIP oficial do Mini-Dev quando necessário, localiza todos os bancos SQLite em `dev_databases`, lê os CSVs de `database_description`, introspecta schemas SQLite e gera:
+
+- Dicionários-base em `data/bird_mini_dev/dictionaries/`
+- Samples de prompt em `data/bird_mini_dev/samples/`
+- Samples maiores para profiling em `data/bird_mini_dev/profile_samples/`
+- Perfis compactos em `data/bird_mini_dev/profiles/`
+- Manifest em `data/bird_mini_dev/manifest.json`
+
+Com `--update-config`, as listas `list_of_profiles`, `list_of_data_samples`, `list_of_data_samples_profiles` e `list_of_data_dictionaries` passam a apontar para os artefatos BIRD gerados, permitindo executar `src/dictionary_generation.py` e `src/compare_results_dictionary.py` sem adaptar seus contratos.
+
 ---
 
 ## Prompt Templates
