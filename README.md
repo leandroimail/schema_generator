@@ -34,12 +34,14 @@ By focusing on the migration and integration of relational data into star schema
 ├── config.yaml                # Main configuration file (paths, models, etc.)
 ├── .env / .env.example        # Environment variables (API keys, model configs)
 ├── pyproject.toml             # Python project dependencies
+├── run.py                     # Pipeline orchestrator (see "Pipeline Orchestrator")
 ├── src/                       # Source code (scripts for each step)
 │   ├── dictionary_generation.py
 │   ├── profilling.py
 │   ├── samples.py
 │   ├── schema_matching_generation.py
 │   ├── compare_results_dictionary.py
+│   ├── bootstrap_bird_mini_dev.py
 │   └── llm.py
 ├── data/                      # Data files (samples, profiles, results)
 │   ├── full_files/            # Full raw data files (e.g., Parquet, CSV)
@@ -230,9 +232,51 @@ Implements clients for OpenAI, Gemini and DeepSeek, abstracting authentication, 
 
 ---
 
+## Pipeline Orchestrator
+
+`run.py` is the single entry point for the full pipeline. It wraps every step
+in a thin subprocess layer, so the existing `src/*.py` scripts keep their
+direct CLI invocations and tests stay decoupled. The orchestrator exposes the
+following subcommands:
+
+| Subcommand   | Wraps                              | Purpose                                                                                      |
+| ------------ | ---------------------------------- | -------------------------------------------------------------------------------------------- |
+| `bootstrap`  | `src/bootstrap_bird_mini_dev.py`   | Download/extract BIRD Mini-Dev and generate dictionaries, samples, profiles, and the manifest. |
+| `generate`   | `src/dictionary_generation.py`     | Run the LLM dictionary generation for every configured profile.                              |
+| `validate`   | (in-process audit)                 | Inspect every `*_parsed.json` under `data_llm_results_dictionary_generation.path` for errors. |
+| `retry-llm`  | `src/dictionary_generation.py`     | Rerun only the provider/profile combinations whose parsed JSON is missing or invalid.        |
+| `compare`    | `src/compare_results_dictionary.py` | Compute cosine-similarity distances and write per-table and per-model summaries.            |
+| `all`        | validate → (retry-llm) → compare   | Convenience wrapper for the post-generation steps.                                           |
+| `pipeline`   | bootstrap → generate → all         | One-shot end-to-end pipeline with optional flags.                                           |
+
+Quick examples:
+
+```bash
+# Bootstrap the BIRD Mini-Dev benchmark and refresh config.yaml in one shot
+python run.py bootstrap --update-config
+
+# Generate LLM dictionaries for every profile
+python run.py generate
+
+# Audit the LLM results without calling any API
+python run.py validate
+
+# Rerun only the failed provider/profile combinations
+python run.py retry-llm
+
+# Compute similarity scores against the reference dictionaries
+python run.py compare
+
+# Full pipeline (bootstrap + generate + validate + retry + compare)
+python run.py pipeline --with-bootstrap --with-generate --with-retry
+```
+
+`run.py` exits with the last non-zero return code from the wrapped script, so
+it composes naturally with `set -e` and CI pipelines.
+
+---
+
 ## Example Usage
-
-
 ### 1. Install Dependencies
 
 This project recommends using [uv](https://github.com/astral-sh/uv), an ultra-fast Python package manager, for dependency management and reproducible environments. `uv sync` ensures your environment matches the dependencies specified in `pyproject.toml` and `poetry.lock` (if present).
@@ -300,6 +344,16 @@ O script consome o ZIP oficial do Mini-Dev quando necessário, localiza todos os
 - Manifest em `data/bird_mini_dev/manifest.json`
 
 Com `--update-config`, as listas `list_of_profiles`, `list_of_data_samples`, `list_of_data_samples_profiles` e `list_of_data_dictionaries` passam a apontar para os artefatos BIRD gerados, permitindo executar `src/dictionary_generation.py` e `src/compare_results_dictionary.py` sem adaptar seus contratos.
+
+### 9. Orquestração via `run.py`
+Todos os passos acima (incluindo o bootstrap do BIRD Mini-Dev) podem ser executados a partir do orquestrador `run.py`. Veja a seção [Pipeline Orchestrator](#pipeline-orchestrator) para a lista completa de subcomandos. Em resumo:
+```bash
+# Pipeline completo: bootstrap + generate + validate + retry-llm + compare
+uv run python run.py pipeline --with-bootstrap --with-generate --with-retry
+
+# Apenas validar, opcionalmente rerodar erros, e comparar
+uv run python run.py all --with-retry
+```
 
 ---
 
