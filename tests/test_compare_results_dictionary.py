@@ -33,6 +33,8 @@ from compare_results_dictionary import (  # noqa: E402
     load_data_dictionary,
     load_json_data,
     calculate_similarities,
+    compute_similarity_metrics,
+    _load_embedding_model,
 )
 
 
@@ -225,6 +227,75 @@ def test_generate_output_json_shape():
 
 
 # ---------------------------------------------------------------------------
+# compute_similarity_metrics
+# ---------------------------------------------------------------------------
+
+
+def test_compute_similarity_metrics_returns_empty_for_empty_input():
+    assert compute_similarity_metrics([]) == {}
+
+
+def test_compute_similarity_metrics_returns_all_keys():
+    metrics = compute_similarity_metrics([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
+    expected_keys = {
+        "mean", "std", "q25", "median", "q75", "d90", "d99", "min", "max", "count"
+    }
+    assert expected_keys.issubset(metrics.keys())
+    assert metrics["count"] == 10
+
+
+def test_compute_similarity_metrics_values_are_correct():
+    scores = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    metrics = compute_similarity_metrics(scores)
+    # 11 values from 0.0 to 1.0 in steps of 0.1
+    assert metrics["mean"] == pytest.approx(0.5)
+    assert metrics["min"] == pytest.approx(0.0)
+    assert metrics["max"] == pytest.approx(1.0)
+    assert metrics["median"] == pytest.approx(0.5)
+    # q25 / q75 for 11 evenly spaced values
+    assert metrics["q25"] == pytest.approx(np.percentile(scores, 25))
+    assert metrics["q75"] == pytest.approx(np.percentile(scores, 75))
+    assert metrics["d90"] == pytest.approx(np.percentile(scores, 90))
+    assert metrics["d99"] == pytest.approx(np.percentile(scores, 99))
+    # ddof=1 sample std
+    assert metrics["std"] == pytest.approx(np.std(scores, ddof=1))
+
+
+def test_compute_similarity_metrics_single_value_zero_std():
+    metrics = compute_similarity_metrics([0.42])
+    assert metrics["mean"] == pytest.approx(0.42)
+    assert metrics["std"] == 0.0
+    assert metrics["median"] == pytest.approx(0.42)
+    assert metrics["min"] == pytest.approx(0.42)
+    assert metrics["max"] == pytest.approx(0.42)
+    assert metrics["count"] == 1
+
+
+def test_compute_similarity_metrics_handles_negative_scores():
+    # cosine similarity range is [-1, 1]
+    metrics = compute_similarity_metrics([-1.0, 0.0, 1.0])
+    assert metrics["min"] == pytest.approx(-1.0)
+    assert metrics["max"] == pytest.approx(1.0)
+    assert metrics["mean"] == pytest.approx(0.0)
+    assert metrics["median"] == pytest.approx(0.0)
+
+
+def test_compute_similarity_metrics_drops_non_finite_scores():
+    """NaN and +/-inf inputs should be dropped, not propagated to metrics."""
+    metrics = compute_similarity_metrics([float("nan"), 0.2, 0.4, float("inf"), 0.6])
+    assert metrics["count"] == 3
+    assert metrics["min"] == pytest.approx(0.2)
+    assert metrics["max"] == pytest.approx(0.6)
+    for v in metrics.values():
+        assert not (isinstance(v, float) and math.isnan(v))
+        assert v != float("inf")
+
+
+def test_compute_similarity_metrics_all_non_finite_returns_empty():
+    assert compute_similarity_metrics([float("nan"), float("inf")]) == {}
+
+
+# ---------------------------------------------------------------------------
 # End-to-end with a fake SentenceTransformer (no model download)
 # ---------------------------------------------------------------------------
 
@@ -232,7 +303,11 @@ def test_generate_output_json_shape():
 class _FakeModel:
     """Returns a deterministic embedding based on the input string length."""
 
-    def encode(self, text):
+    def encode(self, text, **kwargs):
+        # Accept and ignore extra kwargs (normalize_embeddings, batch_size, ...)
+        # so the fake stays compatible with the real `SentenceTransformer.encode`
+        # signature used by `calculate_embeddings` after the refactor.
+        _ = kwargs
         if not isinstance(text, str) or not text.strip():
             return np.zeros(4, dtype=float)
         # Two identical texts -> same vector; different texts -> orthogonal vectors.
@@ -333,10 +408,183 @@ def test_main_end_to_end_with_fake_model(tmp_path, monkeypatch):
     summary = json.loads((out_dir / "all_similarities_results.json").read_text())
     assert table in summary["results"]
     # Exactly 2 models should be present (the error one must be filtered).
-    models = set(summary["average_by_model"].keys())
+    models = set(summary["metrics_by_model"].keys())
     assert models == {"gpt-5.4-mini", "deepseek-v4-flash"}
+    # The metrics payload should expose the full distribution for each model.
+    for model_name, metrics in summary["metrics_by_model"].items():
+        for key in ("mean", "std", "q25", "median", "q75", "d90", "d99", "min", "max", "count"):
+            assert key in metrics, f"missing metric {key} for {model_name}"
+        assert metrics["count"] > 0
+        assert -1.0 <= metrics["min"] <= metrics["max"] <= 1.0
+    # Per-table breakdown should also be present and use the same shape.
+    table_metrics = summary["metrics_by_table_and_model"][table]
+    for model_name, metrics in table_metrics.items():
+        assert "mean" in metrics
+        assert "median" in metrics
     # No scores should be NaN — fake embeddings give valid cosine similarities.
     for field_scores in summary["results"][table].values():
         for score in field_scores.values():
             assert not math.isnan(score)
             assert -1.0 <= score <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# _load_embedding_model — config-driven model loader
+# ---------------------------------------------------------------------------
+
+
+def test_load_embedding_model_defaults_when_block_missing(monkeypatch):
+    """No `embedding:` block (and `None` config) → safe defaults."""
+    captured = {}
+
+    def fake_st(model_name, **kwargs):
+        captured["model_name"] = model_name
+        captured["kwargs"] = kwargs
+        return _FakeModel()
+
+    monkeypatch.setattr(
+        "compare_results_dictionary.SentenceTransformer", fake_st
+    )
+
+    # Empty config.
+    model, encode_kwargs = _load_embedding_model({})
+    assert isinstance(model, _FakeModel)
+    assert captured["model_name"] == "all-MiniLM-L6-v2"
+    assert captured["kwargs"]["device"] == "cpu"
+    assert captured["kwargs"]["cache_folder"] is None
+    assert encode_kwargs == {"normalize_embeddings": False, "batch_size": 32}
+
+    # `config=None` is also tolerated (defensive).
+    captured.clear()
+    _load_embedding_model(None)
+    assert captured["model_name"] == "all-MiniLM-L6-v2"
+
+    # Explicit empty mapping.
+    captured.clear()
+    _load_embedding_model({"embedding": {}})
+    assert captured["model_name"] == "all-MiniLM-L6-v2"
+
+
+def test_load_embedding_model_uses_config_values(monkeypatch):
+    """All fields in the `embedding:` block are honored."""
+    captured = {}
+
+    def fake_st(model_name, **kwargs):
+        captured["model_name"] = model_name
+        captured["kwargs"] = kwargs
+        return _FakeModel()
+
+    monkeypatch.setattr(
+        "compare_results_dictionary.SentenceTransformer", fake_st
+    )
+
+    config = {
+        "embedding": {
+            "model_name": "BAAI/bge-small-en-v1.5",
+            "device": "mps",
+            "cache_dir": "/tmp/cache",
+            "normalize_embeddings": True,
+            "batch_size": 64,
+        }
+    }
+    model, encode_kwargs = _load_embedding_model(config)
+    assert captured["model_name"] == "BAAI/bge-small-en-v1.5"
+    assert captured["kwargs"]["device"] == "mps"
+    assert captured["kwargs"]["cache_folder"] == "/tmp/cache"
+    assert encode_kwargs == {"normalize_embeddings": True, "batch_size": 64}
+
+
+def test_load_embedding_model_rejects_non_mapping(monkeypatch):
+    """Any non-mapping, non-None value under `embedding:` → ValueError.
+
+    `None` is treated as "absent" (matches YAML/JSON `null`/`~` convention)
+    and falls back to defaults; all other scalars/sequences are rejected.
+    Covers str, bytes, int, float, bool, list, tuple, set.
+    """
+    calls = {"n": 0}
+
+    def fake_st(*a, **kw):
+        calls["n"] += 1
+        return _FakeModel()
+
+    monkeypatch.setattr(
+        "compare_results_dictionary.SentenceTransformer", fake_st
+    )
+
+    bad_values = [
+        "BAAI/bge-small-en-v1.5",   # str
+        b"bytes-not-allowed",       # bytes
+        42,                         # int
+        3.14,                       # float
+        True,                       # bool — must raise (not coalesce to {})
+        False,                      # bool — also must raise
+        ["a", "b"],                 # list
+        ("a", "b"),                 # tuple
+        {"a", "b"},                 # set
+    ]
+    for bad in bad_values:
+        with pytest.raises(ValueError, match="must be a mapping"):
+            _load_embedding_model({"embedding": bad})
+
+    # Constructor must not have been called for any of the bad payloads.
+    assert calls["n"] == 0
+
+    # Positive control #1: a real dict is accepted (falls back to defaults).
+    _load_embedding_model({"embedding": {}})
+    assert calls["n"] == 1
+
+    # Positive control #2: `None` (YAML/JSON null) is treated as "absent"
+    # and silently uses defaults — same effect as omitting the key entirely.
+    _load_embedding_model({"embedding": None})
+    assert calls["n"] == 2
+
+
+def test_load_embedding_model_handles_missing_cache_folder_kwarg(monkeypatch):
+    """Older sentence-transformers without `cache_folder` → fallback branch."""
+    calls = {"n": 0}
+
+    def fake_st(model_name, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TypeError("unexpected kwarg cache_folder")
+        # Second call (no cache_folder) records the kwargs for assertion.
+        calls.setdefault("second_kwargs", kwargs)
+        return _FakeModel()
+
+    monkeypatch.setattr(
+        "compare_results_dictionary.SentenceTransformer", fake_st
+    )
+
+    config = {"embedding": {"model_name": "X", "cache_dir": "/tmp"}}
+    model, _ = _load_embedding_model(config)
+    assert calls["n"] == 2
+    assert isinstance(model, _FakeModel)
+    # On the retry path `cache_folder` is NOT forwarded.
+    assert "cache_folder" not in calls["second_kwargs"]
+
+
+def test_load_embedding_model_logs_summary(monkeypatch, caplog):
+    """Log line includes model_name, device, normalize, batch_size, cache_dir."""
+    import logging
+
+    monkeypatch.setattr(
+        "compare_results_dictionary.SentenceTransformer",
+        lambda *a, **kw: _FakeModel(),
+    )
+    config = {
+        "embedding": {
+            "model_name": "BAAI/bge-small-en-v1.5",
+            "device": "cpu",
+            "cache_dir": "/tmp/c",
+            "normalize_embeddings": True,
+            "batch_size": 16,
+        }
+    }
+    with caplog.at_level(logging.INFO, logger="compare_results_dictionary"):
+        _load_embedding_model(config)
+    msg = " ".join(rec.getMessage() for rec in caplog.records)
+    assert "BAAI/bge-small-en-v1.5" in msg
+    assert "cpu" in msg
+    assert "normalize=True" in msg
+    assert "batch_size=16" in msg
+    assert "/tmp/c" in msg
