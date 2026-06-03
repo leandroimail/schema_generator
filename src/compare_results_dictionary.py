@@ -4,10 +4,36 @@ import json
 import csv
 import glob
 import logging
-from typing import Dict, List, Any, Union, Tuple
+from typing import Dict, List, Any, Union, Tuple, TypedDict
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
+
+
+class EmbeddingConfig(TypedDict, total=False):
+    """Schema for the `embedding:` block in `config.yaml`.
+
+    All fields are optional — the helper `_load_embedding_model` fills in
+    safe defaults for anything missing. See `reports/EMBEDDING_MODEL.md` §4
+    for the field-by-field rationale and the recommended override
+    (`BAAI/bge-small-en-v1.5`).
+    """
+
+    model_name: str
+    device: str
+    cache_dir: str
+    normalize_embeddings: bool
+    batch_size: int
+
+
+class EncodeKwargs(TypedDict):
+    """Kwargs forwarded to every `model.encode(...)` call.
+
+    Sourced from `EmbeddingConfig` (`normalize_embeddings`, `batch_size`).
+    """
+
+    normalize_embeddings: bool
+    batch_size: int
 
 # Logger configuration
 logging.basicConfig(
@@ -33,6 +59,59 @@ def load_config(config_path: str) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Error loading configuration file: {e}")
         raise
+
+def _load_embedding_model(
+    config: Dict[str, Any],
+) -> Tuple[SentenceTransformer, EncodeKwargs]:
+    """
+    Builds a SentenceTransformer from the `embedding:` block of the config
+    and the kwargs to forward to `model.encode(...)`.
+
+    Falls back to safe defaults (`all-MiniLM-L6-v2`, `cpu`, no normalization,
+    `batch_size=32`) so the script keeps working when the block is missing —
+    important for older configs and the test suite.
+
+    Args:
+        config: Full config dict loaded by `load_config`.
+
+    Returns:
+        A `(model, encode_kwargs)` tuple. `encode_kwargs` is a TypedDict
+        with `normalize_embeddings` and `batch_size`, splatted into every
+        `model.encode(...)` call.
+    """
+    emb_cfg: EmbeddingConfig = (config or {}).get("embedding")  # type: ignore[assignment]
+    if emb_cfg is None:
+        emb_cfg = {}
+    if not isinstance(emb_cfg, dict):
+        raise ValueError(
+            f"'embedding' must be a mapping, got {type(emb_cfg).__name__}"
+        )
+
+    model_name = emb_cfg.get("model_name", "all-MiniLM-L6-v2")
+    device = emb_cfg.get("device", "cpu")
+    cache_dir = emb_cfg.get("cache_dir")
+    normalize_embeddings = bool(emb_cfg.get("normalize_embeddings", False))
+    batch_size = int(emb_cfg.get("batch_size", 32))
+
+    logger.info(
+        f"Loading embedding model: {model_name} "
+        f"(device={device}, normalize={normalize_embeddings}, "
+        f"batch_size={batch_size}, cache_dir={cache_dir})"
+    )
+
+    try:
+        model = SentenceTransformer(
+            model_name, device=device, cache_folder=cache_dir
+        )
+    except TypeError:
+        # Older sentence-transformers versions don't accept `cache_folder`.
+        model = SentenceTransformer(model_name, device=device)
+
+    encode_kwargs: EncodeKwargs = {
+        "normalize_embeddings": normalize_embeddings,
+        "batch_size": batch_size,
+    }
+    return model, encode_kwargs
 
 def load_json_data(file_path: str) -> Dict[str, Any]:
     """
@@ -118,8 +197,9 @@ def find_all_files_in_directory(directory: str, extensions: List[str] = ['.json'
         return []
 
 def calculate_embeddings(
-    data: Dict[str, Any], 
-    model: SentenceTransformer
+    data: Dict[str, Any],
+    model: SentenceTransformer,
+    encode_kwargs: Union[EncodeKwargs, None] = None,
 ) -> Dict[str, np.ndarray]:
     """
     Calculates embeddings for table_description and all full_descriptions in fields.
@@ -127,19 +207,24 @@ def calculate_embeddings(
     Args:
         data: Dictionary containing table_description and fields.
         model: Pre-loaded SentenceTransformer model.
+        encode_kwargs: Optional `EncodeKwargs` TypedDict forwarded to
+            `model.encode(...)` (e.g. `{"normalize_embeddings": True,
+            "batch_size": 32}`). When `None` the call is made with no extra
+            kwargs, preserving the pre-config behavior.
 
     Returns:
         Dictionary with keys as 'table_description' and each field_name, values as their embeddings.
     """
+    kwargs: Dict[str, Any] = dict(encode_kwargs) if encode_kwargs else {}
     embeddings: Dict[str, np.ndarray] = {}
     try:
         # Embed table_description if present
         table_desc: str = data.get("table_description", "")
         if isinstance(table_desc, str) and table_desc.strip():
-            embeddings["table_description"] = model.encode(table_desc)
+            embeddings["table_description"] = model.encode(table_desc, **kwargs)
         else:
             logger.warning("No valid table_description found.")
-            embeddings["table_description"] = model.encode("")
+            embeddings["table_description"] = model.encode("", **kwargs)
 
         # Embed each field's full_description using field_name as key
         fields = data.get("fields", [])
@@ -151,10 +236,10 @@ def calculate_embeddings(
                     field_desc = field.get("field_description", "")
                 if field_name:
                     if isinstance(field_desc, str) and field_desc.strip():
-                        embeddings[field_name] = model.encode(field_desc)
+                        embeddings[field_name] = model.encode(field_desc, **kwargs)
                     else:
                         logger.warning(f"Field {field_name} has empty or invalid full_description.")
-                        embeddings[field_name] = model.encode("")
+                        embeddings[field_name] = model.encode("", **kwargs)
         else:
             logger.warning("No valid fields list found in data.")
     except Exception as e:
@@ -210,6 +295,56 @@ def generate_output_json(table_name: str, model_name: str, similarities: List[Di
         "par-compare-models": model_name,
         "similarities": similarities
     }
+
+
+def compute_similarity_metrics(scores: List[float]) -> Dict[str, float]:
+    """
+    Compute distribution metrics for a list of similarity scores.
+
+    Reported metrics:
+        - ``mean``: arithmetic mean
+        - ``std``: sample standard deviation (ddof=1); 0.0 when fewer than 2 samples
+        - ``q25``: 25th percentile
+        - ``median``: 50th percentile
+        - ``q75``: 75th percentile
+        - ``d90``: 90th percentile
+        - ``d99``: 99th percentile
+        - ``min``: minimum score
+        - ``max``: maximum score
+        - ``count``: number of scores used
+
+    Non-finite scores (NaN, +/-inf) are dropped before computing the metrics.
+
+    Args:
+        scores: List of cosine similarity scores in the [-1, 1] range.
+
+    Returns:
+        Dictionary with the requested metrics. Empty input yields an empty dict.
+    """
+    if not scores:
+        return {}
+
+    arr = np.asarray(scores, dtype=float)
+    if arr.size == 0:
+        return {}
+
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return {}
+
+    metrics: Dict[str, float] = {
+        "mean": float(np.mean(finite)),
+        "std": float(np.std(finite, ddof=1)) if finite.size > 1 else 0.0,
+        "q25": float(np.percentile(finite, 25)),
+        "median": float(np.percentile(finite, 50)),
+        "q75": float(np.percentile(finite, 75)),
+        "d90": float(np.percentile(finite, 90)),
+        "d99": float(np.percentile(finite, 99)),
+        "min": float(np.min(finite)),
+        "max": float(np.max(finite)),
+        "count": int(finite.size),
+    }
+    return metrics
 
 def extract_table_and_model_names(data_llm_dir: str, file_path: str) -> Tuple[str, str]:
     """
@@ -321,8 +456,7 @@ def main(config_path: str = "config.yaml"):
             logger.info(f"Skipped {skipped_errors} LLM result file(s) containing errors.")
 
         # 4. Initialize embeddings model
-        logger.info("Initializing embeddings model...")
-        model = SentenceTransformer('all-MiniLM-L6-v2')
+        model, encode_kwargs = _load_embedding_model(config)
 
         # 5. Calculate embeddings and similarities
         logger.info("Calculating embeddings and similarities...")
@@ -331,10 +465,10 @@ def main(config_path: str = "config.yaml"):
         saved_files_count = 0  # Counter for saved files
 
         for table_name, baseline_data in baseline_dicts.items():
-            baseline_emb = calculate_embeddings(baseline_data, model)
+            baseline_emb = calculate_embeddings(baseline_data, model, encode_kwargs)
             if table_name in llm_dicts:
                 for model_name, llm_data in llm_dicts[table_name].items():
-                    llm_emb = calculate_embeddings(llm_data, model)
+                    llm_emb = calculate_embeddings(llm_data, model, encode_kwargs)
                     similarities = []
                     baseline_fields = {f.get("field_name", ""): f.get("field_description", "") for f in baseline_data.get("fields", []) if "field_name" in f}
                     llm_fields = {f.get("field_name", ""): f.get("full_description", f.get("field_description", "")) for f in llm_data.get("fields", []) if "field_name" in f}
@@ -381,55 +515,49 @@ def main(config_path: str = "config.yaml"):
 
         # Save all results in a single file in the specified output directory (refactored structure)
         if results:
-            # Calculate average similarities per table/model and per model
-            averages_by_table_model = {}
-            model_scores = {}
-            
-            # Calculate averages by table and model
+            # Calculate distribution metrics per table/model and per model
+            metrics_by_table_model: Dict[str, Dict[str, Dict[str, float]]] = {}
+            model_scores: Dict[str, List[float]] = {}
+
+            # Collect scores per (table, model) and per model
             for table_name, fields in results.items():
-                averages_by_table_model[table_name] = {}
+                metrics_by_table_model[table_name] = {}
                 # Get all models present in this table
                 models_in_table = set()
                 for field_data in fields.values():
                     for model_name in field_data.keys():
                         models_in_table.add(model_name)
-                        
-                # For each model in this table, calculate average score
+
+                # For each model in this table, compute metrics over the field scores
                 for model_name in models_in_table:
-                    scores = []
-                    for field, field_data in fields.items():
+                    scores: List[float] = []
+                    for field_data in fields.values():
                         if model_name in field_data:
                             scores.append(field_data[model_name])
-                            
-                            # Add score to model's overall collection for later
-                            if model_name not in model_scores:
-                                model_scores[model_name] = []
-                            model_scores[model_name].append(field_data[model_name])
-                            
-                    # Calculate average for this table/model if we have scores
+                            model_scores.setdefault(model_name, []).append(field_data[model_name])
+
                     if scores:
-                        avg_score = sum(scores) / len(scores)
-                        averages_by_table_model[table_name][model_name] = float(avg_score)
-            
-            # Calculate overall average by model across all tables
-            averages_by_model = {}
-            for model_name, scores in model_scores.items():
-                if scores:
-                    avg_score = sum(scores) / len(scores)
-                    averages_by_model[model_name] = float(avg_score)
-            
-            # Create final structured output with results and averages
+                        metrics_by_table_model[table_name][model_name] = compute_similarity_metrics(scores)
+
+            # Calculate overall metrics by model across all tables
+            metrics_by_model: Dict[str, Dict[str, float]] = {
+                model_name: compute_similarity_metrics(scores)
+                for model_name, scores in model_scores.items()
+                if scores
+            }
+
+            # Create final structured output with results and metrics
             final_results = {
                 "results": results,
-                "average_by_table_and_model": averages_by_table_model,
-                "average_by_model": averages_by_model
+                "metrics_by_table_and_model": metrics_by_table_model,
+                "metrics_by_model": metrics_by_model,
             }
-            
+
             all_results_file = os.path.join(output_dir, "all_similarities_results.json")
             try:
                 with open(all_results_file, 'w', encoding='utf-8') as f:
                     json.dump(final_results, f, indent=2, ensure_ascii=False)
-                logger.info(f"All results with averages ({len(results)} tables) saved at: {all_results_file}")
+                logger.info(f"All results with metrics ({len(results)} tables) saved at: {all_results_file}")
                 saved_files_count += 1
             except Exception as e:
                 logger.error(f"Error saving consolidated results file: {e}")

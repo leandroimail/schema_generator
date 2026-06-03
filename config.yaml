@@ -835,6 +835,21 @@ data_llm_results_profile_generation_base:
   path: data/llm_results
 data_llm_results_distance_calculation:
   path: data/distance_calculation
+# Embedding model used by `src/compare_results_dictionary.py` to compute
+# cosine-similarity between LLM-generated and reference field descriptions.
+# See `reports/EMBEDDING_MODEL.md` for the academic/benchmark rationale
+# behind the default choice. Override `model_name` to swap in another
+# sentence-transformer (e.g. PORTULAN/serafim-100m-portuguese-pt-sentence-encoder-ir
+# for Portuguese content). Any model_id accepted by `SentenceTransformer` is valid.
+# `normalize_embeddings` and `batch_size` are forwarded to every `model.encode(...)`
+# call (set `normalize_embeddings: true` only if you compute cosine similarity
+# via dot product instead of `sklearn.metrics.pairwise.cosine_similarity`).
+embedding:
+  model_name: BAAI/bge-small-en-v1.5
+  device: cpu
+  cache_dir: .cache/embeddings
+  normalize_embeddings: false
+  batch_size: 32
 bird_mini_dev:
   dataset_root: benchmark/bird_mini_dev
   manifest_path: data/bird_mini_dev/manifest.json
